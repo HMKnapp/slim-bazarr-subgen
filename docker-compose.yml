@@ -17,6 +17,7 @@ services:
        - "/tmp/subgen/models:/models"
     ports:
        - 8090:9000
+    restart: unless-stopped
     deploy:
       resources:
         reservations:

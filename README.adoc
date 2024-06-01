@@ -1,0 +1,57 @@
+= slim bazarr subgen
+
+====
+_slim bazarr subgen_ uses Whisper AI models to automatically create subtitles for your media files in Bazarr.
+====
+
+It is simply a *slimmed down version of https://github.com/McCloudS/subgen[McCloudS’ subgen]* (thank you for making your code available!) which never worked for me without ugly hacks.
+
+I did this because I wanted subtitles for a TV show this evening and McCloudS/subgen (again) would suddenly not start for whatever reason, and I didn’t care anymore to find out why.
+
+NOTE: _slim bazarr subgen_ only includes functionality required for https://www.bazarr.media/[Bazarr] subtitle generation
+
+The idea is to have a reliable subtitle service on a much smaller code base which makes it easier to maintain, extend and use.
+
+[#design]
+== Design decisions
+
+- caches and models go to `/tmp` (RAM)
+- remove everything not needed for Bazarr
+- less is more
+
+[#assumptions]
+== Assumptions
+
+- you use Docker
+- you have an Nvidia GPU and `nvidia-container-toolkit` (but works with CPU as well)
+- you have a proper amount of RAM reserved for `tmpfs` in `/tmp`
+
+[#alternatives]
+== Alternatives
+
+You might like those better:
+
+- https://github.com/McCloudS/subgen[McCloudS/subgen]
+- https://github.com/ahmetoner/whisper-asr-webservice[ahmetoner/whisper-asr-webservice]
+
+[#run]
+== Run
+
+[source,sh]
+----
+docker-compose up --build; docker-compose down --remove-orphans
+----
+
+[#configuration]
+== Configuration
+
+Look at `docker-compose.yml` for limited configuration options.
+
+Look here for available models: https://github.com/openai/whisper/blob/main/README.md#available-models-and-languages
+
+[#configure_bazarr]
+=== Bazarr
+
+How to configure Bazarr to use Whisper AI subtitle creation: https://wiki.bazarr.media/Additional-Configuration/Whisper-Provider/
+
+IMPORTANT: Default port is `8090`

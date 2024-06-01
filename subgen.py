@@ -1,6 +1,5 @@
 subgen_version = '24.06.01'
 
-from datetime import datetime
 import os
 import xml.etree.ElementTree as ET
 import threading
@@ -10,8 +9,8 @@ import queue
 import logging
 import gc
 import random
-from typing import BinaryIO, Union, Any
-from fastapi import FastAPI, File, UploadFile, Query, Header, Body, Form, Request
+from typing import Union
+from fastapi import FastAPI, File, UploadFile, Query, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 import numpy as np
 

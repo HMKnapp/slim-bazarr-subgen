@@ -360,4 +360,4 @@ if __name__ == "__main__":
     print(log_str)
     print()
     os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
-    uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, use_colors=True)
+    uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, log_level='error', use_colors=True)

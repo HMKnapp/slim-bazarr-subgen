@@ -1,8 +1,8 @@
 services:
   subgen:
-    container_name: subgen
+    container_name: slim-bazarr-subgen
     tty: true
-    image: hmknapp/subgen
+    image: hmknapp/slim-bazarr-subgen
     build:
       context: .
     environment:

@@ -1,4 +1,4 @@
-subgen_version = '2024.5.15.78'
+subgen_version = '24.06.01'
 
 from datetime import datetime
 import os
@@ -143,7 +143,7 @@ TIME_OFFSET = 5
 
 @app.get("/status")
 def status():
-    return {"version" : f"Subgen {subgen_version}, stable-ts {stable_whisper.__version__}, faster-whisper {faster_whisper.__version__} ({docker_status})"}
+    return {"version" : f"slim-bazarr-subgen {subgen_version}, stable-ts {stable_whisper.__version__}, faster-whisper {faster_whisper.__version__} ({docker_status})"}
    
 # idea and some code for asr and detect language from https://github.com/ahmetoner/whisper-asr-webservice
 @app.post("//asr")
@@ -353,10 +353,12 @@ env_variables = {
 if __name__ == "__main__":
     import uvicorn
     update_env_variables()
-    logging.info(f"Subgen v{subgen_version}")
-    logging.info(f"Transcriptions are limited to running {str(concurrent_transcriptions)} at a time")
-    logging.info(f"Running {str(whisper_threads)} threads per transcription")
-    logging.info(f"Using {transcribe_device} to encode")
-    logging.info(f"Using faster-whisper with model {whisper_model}")
+    log_str = f"slim-bazarr-subgen v{subgen_version} | {transcribe_device}"
+    if transcribe_device == 'cpu':
+        log_str += f" @ {whisper_threads} threads"
+
+    print()
+    print(log_str)
+    print()
     os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
     uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, use_colors=True)

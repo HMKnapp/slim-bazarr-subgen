@@ -8,7 +8,6 @@ services:
     environment:
        - "WHISPER_MODEL=tiny"
        - "WHISPER_THREADS=30"
-       - "CONCURRENT_TRANSCRIPTIONS=1"
        - "WORD_LEVEL_HIGHLIGHT=False"
        - "TRANSCRIBE_DEVICE=gpu"
        - "TRANSCRIBE_OR_TRANSLATE=transcribe"

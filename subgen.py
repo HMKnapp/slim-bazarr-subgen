@@ -1,9 +1,7 @@
 subgen_version = '2024.5.15.78'
 
 from datetime import datetime
-import subprocess
 import os
-import json
 import xml.etree.ElementTree as ET
 import threading
 import sys
@@ -11,7 +9,6 @@ import time
 import queue
 import logging
 import gc
-import io
 import random
 from typing import BinaryIO, Union, Any
 from fastapi import FastAPI, File, UploadFile, Query, Header, Body, Form, Request
@@ -20,11 +17,7 @@ import numpy as np
 
 import stable_whisper
 from stable_whisper import Segment
-import requests
-import av
-import ffmpeg
 import whisper
-import re
 
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
@@ -49,7 +42,7 @@ def update_env_variables():
     global detect_language_length
     
     whisper_model = os.getenv('WHISPER_MODEL', 'medium')
-    whisper_threads = int(os.getenv('WHISPER_THREADS', 4))
+    whisper_threads = max(1, os.cpu_count() - 1)
     concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 1))
     transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'gpu')
     webhookport = int(os.getenv('WEBHOOKPORT', 9000))

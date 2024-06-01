@@ -1,0 +1,27 @@
+services:
+  subgen:
+    container_name: subgen
+    tty: true
+    image: hmknapp/subgen
+    build:
+      context: .
+    environment:
+       - "WHISPER_MODEL=tiny"
+       - "WHISPER_THREADS=30"
+       - "CONCURRENT_TRANSCRIPTIONS=1"
+       - "WORD_LEVEL_HIGHLIGHT=False"
+       - "TRANSCRIBE_DEVICE=gpu"
+       - "TRANSCRIBE_OR_TRANSLATE=transcribe"
+    volumes:
+       - "./subgen.py:/subgen/subgen.py"
+       - "/tmp/subgen/dist-packages:/usr/local/lib/python3.10/dist-packages"
+       - "/tmp/subgen/models:/models"
+    ports:
+       - 8090:9000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

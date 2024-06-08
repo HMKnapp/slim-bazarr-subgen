@@ -6,7 +6,7 @@ services:
     build:
       context: .
     environment:
-       - "WHISPER_MODEL=tiny"
+       - "WHISPER_MODEL=large-v3"
        - "WHISPER_THREADS=30"
        - "WORD_LEVEL_HIGHLIGHT=False"
        - "TRANSCRIBE_DEVICE=gpu"
@@ -14,6 +14,7 @@ services:
     volumes:
        - "./subgen.py:/subgen/subgen.py"
        - "/tmp/subgen/dist-packages:/usr/local/lib/python3.10/dist-packages"
+       - "/tmp/subgen/cache:/root/.cache"
        - "/tmp/subgen/models:/models"
     ports:
        - 8090:9000

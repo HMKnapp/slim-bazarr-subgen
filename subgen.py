@@ -1,4 +1,4 @@
-subgen_version = '24.06.01'
+subgen_version = '24.07.03'
 
 import os
 import xml.etree.ElementTree as ET
@@ -54,7 +54,7 @@ def update_env_variables():
     reload_script_on_change = convert_to_bool(os.getenv('RELOAD_SCRIPT_ON_CHANGE', False))
     custom_model_prompt = os.getenv('CUSTOM_MODEL_PROMPT', '')
     custom_regroup = os.getenv('CUSTOM_REGROUP', 'cm_sl=84_sl=42++++++1')
-    detect_language_length = os.getenv('DETECT_LANGUAGE_LENGTH', 90)
+    detect_language_length = os.getenv('DETECT_LANGUAGE_LENGTH', 240)
    
     if transcribe_device == "gpu":
         transcribe_device = "cuda"

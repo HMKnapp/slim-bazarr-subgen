@@ -1,4 +1,4 @@
-subgen_version = '24.07.03'
+subgen_version = '24.11.23'
 
 import os
 import xml.etree.ElementTree as ET

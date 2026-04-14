@@ -3,6 +3,7 @@ subgen_version = '24.11.23'
 import os
 import xml.etree.ElementTree as ET
 import threading
+from threading import Lock
 import sys
 import time
 import queue
@@ -46,7 +47,7 @@ def update_env_variables():
     transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'gpu')
     webhookport = int(os.getenv('WEBHOOKPORT', 9000))
     word_level_highlight = convert_to_bool(os.getenv('WORD_LEVEL_HIGHLIGHT', False))
-    debug = convert_to_bool(os.getenv('DEBUG', True))
+    debug = convert_to_bool(os.getenv('DEBUG', False))
     model_location = '/models'
     transcribe_or_translate = os.getenv('TRANSCRIBE_OR_TRANSLATE', 'transcribe')
     force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', '').lower()
@@ -68,9 +69,60 @@ in_docker = os.path.exists('/.dockerenv')
 docker_status = "Docker" if in_docker else "Standalone"
 last_print_time = None
 
+# deduplicated queue taken from 
+class DeduplicatedQueue(queue.Queue):
+    """Queue that prevents duplicates in both queued and in-progress tasks."""
+    def __init__(self):
+        super().__init__()
+        self._queued = set()    # Tracks paths in the queue
+        self._processing = set()  # Tracks paths being processed
+        self._lock = Lock()     # Ensures thread safety
+
+    def put(self, item, block=True, timeout=None):
+        with self._lock:
+            path = item["path"]
+            if path not in self._queued and path not in self._processing:
+                super().put(item, block, timeout)
+                self._queued.add(path)
+
+    def get(self, block=True, timeout=None):
+        item = super().get(block, timeout)
+        with self._lock:
+            path = item["path"]
+            self._queued.discard(path)  # Remove from queued set
+            self._processing.add(path)  # Mark as in-progress
+        return item
+
+    def task_done(self):
+        super().task_done()
+        with self._lock:
+            # Assumes task_done() is called after processing the item from get()
+            # If your workers process multiple items per get(), adjust logic here
+            if self.unfinished_tasks == 0:
+                self._processing.clear()  # Reset when all tasks are done
+
+    def is_processing(self):
+        """Return True if any tasks are being processed."""
+        with self._lock:
+            return len(self._processing) > 0
+
+    def is_idle(self):
+        """Return True if queue is empty AND no tasks are processing."""
+        return self.empty() and not self.is_processing()
+
+    def get_queued_tasks(self):
+        """Return a list of queued task paths."""
+        with self._lock:
+            return list(self._queued)
+
+    def get_processing_tasks(self):
+        """Return a list of paths being processed."""
+        with self._lock:
+            return list(self._processing)
+
 #start queue
 global task_queue
-task_queue = queue.Queue()
+task_queue = DeduplicatedQueue()
 
 def transcription_worker():
     while True:
@@ -136,7 +188,9 @@ def progress(seek, total):
             # Update the last print time
             last_print_time = current_time
             # Log the message
-            logging.info("​")
+            logging.info("")
+            processing = task_queue.get_processing_tasks()[0]
+            logging.info(f"Processing file: {processing}")
 
 TIME_OFFSET = 5
 
@@ -168,9 +222,9 @@ def asr(
         
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
         if custom_regroup:
-            result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
+            result = model.transcribe(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
         else:
-            result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt)
+            result = model.transcribe(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt)
         elapsed_time = time.time() - start_time
         minutes, seconds = divmod(int(elapsed_time), 60)
         logging.info(f"Bazarr transcription is completed, it took {minutes} minutes and {seconds} seconds to complete.")
@@ -207,7 +261,7 @@ def detect_language(
         task_queue.put(task_id)
         
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-        detected_language = model.transcribe_stable(whisper.pad_or_trim(audio_data, int(detect_language_length) * 16000), input_sr=16000).language
+        detected_language = model.transcribe(whisper.pad_or_trim(audio_data, int(detect_language_length) * 16000), input_sr=16000).language
         # reverse lookup of language -> code, ex: "english" -> "en", "nynorsk" -> "nn", ...
         language_code = get_key_by_value(whisper_languages, detected_language)
 

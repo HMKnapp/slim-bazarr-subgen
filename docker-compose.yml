@@ -13,6 +13,7 @@ services:
        - "TRANSCRIBE_DEVICE=gpu"
        - "TRANSCRIBE_OR_TRANSLATE=transcribe"
        - "DETECT_LANGUAGE_LENGTH=240"
+       - "TMDB_API_KEY=${TMDB_API_KEY}"
     volumes:
        - "./subgen.py:/subgen/subgen.py"
        - "./.env:/subgen/.env"

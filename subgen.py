@@ -92,9 +92,9 @@ _QUALITY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ── SxxExx TV episode pattern ──
+# ── SxxExx TV episode pattern — optional year between title and SxxExx ──
 _TV_RE = re.compile(
-    r'^(.+?)[.\s]S(\d{1,2})E(\d{1,2})(?:[.\s](.+?))?(?=' + _QUALITY_RE.pattern + r'|$)',
+    r'^(.+?)[.\s](?:((?:19|20)\d{2})[.\s])?S(\d{1,2})E(\d{1,2})(?:[.\s](.+?))?(?=' + _QUALITY_RE.pattern + r'|$)',
     re.IGNORECASE,
 )
 
@@ -112,14 +112,15 @@ def parse_video_filename(video_file: str) -> dict | None:
     tv = _TV_RE.match(name)
     if tv:
         show = tv.group(1).replace('.', ' ').strip()
-        season = int(tv.group(2))
-        episode = int(tv.group(3))
-        ep_title_raw = tv.group(4)
+        year = int(tv.group(2)) if tv.group(2) else None
+        season = int(tv.group(3))
+        episode = int(tv.group(4))
+        ep_title_raw = tv.group(5)
         ep_title = ep_title_raw.replace('.', ' ').strip() if ep_title_raw else None
         # Drop ep_title if it looks like a quality tag
         if ep_title and _QUALITY_RE.search('.' + ep_title):
             ep_title = None
-        return {'type': 'tv', 'show': show, 'season': season, 'episode': episode, 'ep_title': ep_title}
+        return {'type': 'tv', 'show': show, 'year': year, 'season': season, 'episode': episode, 'ep_title': ep_title}
 
     movie = _MOVIE_RE.match(name)
     if movie:
@@ -196,10 +197,8 @@ def _build_context_prompt(title_line: str, characters: list[str], keywords: list
     Whisper continues in the same style rather than treating it as an instruction.
     """
     terms = [t for t in characters[:6] + keywords[:3] if t]
-    if terms:
-        prompt = f"{title_line}: {', '.join(terms)}."
-    else:
-        prompt = title_line
+    all_parts = [title_line] + terms
+    prompt = ', '.join(all_parts) + '.'
     # Stay well under 224 tokens; ~200 chars ≈ 50 tokens
     if len(prompt) > 200:
         prompt = prompt[:200].rsplit(' ', 1)[0]
@@ -214,7 +213,7 @@ def fetch_media_context(parsed: dict | None) -> dict | None:
         if parsed['type'] == 'movie':
             return _fetch_movie_context(parsed['title'], parsed['year'])
         else:
-            return _fetch_tv_context(parsed['show'], parsed['season'], parsed['episode'])
+            return _fetch_tv_context(parsed['show'], parsed['season'], parsed['episode'], parsed.get('year'))
     except Exception as e:
         logging.warning(f"TMDB lookup failed, skipping prompt enrichment: {e}")
         return None
@@ -239,8 +238,14 @@ def _fetch_movie_context(title: str, year: int) -> str | None:
     return _build_context_prompt(title, characters, keywords)
 
 
-def _fetch_tv_context(show: str, season: int, episode: int) -> str | None:
-    data = _tmdb_get('/search/tv', {'query': show, 'language': 'en-US'})
+def _fetch_tv_context(show: str, season: int, episode: int, year: int | None = None) -> str | None:
+    params = {'query': show, 'language': 'en-US'}
+    if year:
+        params['first_air_date_year'] = year
+    data = _tmdb_get('/search/tv', params)
+    # If year-filtered search returns nothing, retry without it
+    if not data.get('results') and year:
+        data = _tmdb_get('/search/tv', {'query': show, 'language': 'en-US'})
     if not data.get('results'):
         return None
 
@@ -265,11 +270,11 @@ def _fetch_tv_context(show: str, season: int, episode: int) -> str | None:
     except Exception:
         ep_name = ''
 
-    title_line = f"{show} S{season:02d}E{episode:02d}"
-    if ep_name:
-        title_line += f" – {ep_name}."
+    # Split bilingual/slash episode titles (e.g. "Day One/Välkommen") into
+    # separate terms so each part contributes vocabulary without punctuation noise.
+    ep_parts = [p.strip() for p in ep_name.split('/') if p.strip()] if ep_name else []
 
-    return _build_context_prompt(title_line, characters, keywords)
+    return _build_context_prompt(show.title(), ep_parts + characters, keywords)
 
 
 app = FastAPI()
@@ -473,7 +478,7 @@ def asr(
         )
         if custom_regroup:
             transcribe_kwargs['regroup'] = custom_regroup
-        result = model.transcribe(audio_data, **transcribe_kwargs)
+        result = _transcribe_with_cpu_fallback(audio_data, transcribe_kwargs)
         elapsed_time = time.time() - start_time
         minutes, seconds = divmod(int(elapsed_time), 60)
         logging.info(f"Bazarr transcription is completed, it took {minutes} minutes and {seconds} seconds to complete.")
@@ -541,6 +546,30 @@ def detect_language(
         task_queue.task_done()
         delete_model()
         return {"detected_language": detected_language, "language_code": language_code}
+
+def _transcribe_with_cpu_fallback(audio_data, transcribe_kwargs):
+    """Run transcription; on CUDA OOM reload the model on CPU and retry once."""
+    global model
+    try:
+        return model.transcribe(audio_data, **transcribe_kwargs)
+    except RuntimeError as e:
+        if 'out of memory' not in str(e).lower():
+            raise
+        logging.warning("CUDA out of memory — reloading model on CPU and retrying transcription...")
+        model = None
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        model = stable_whisper.load_faster_whisper(
+            whisper_model, download_root=model_location,
+            device='cpu', cpu_threads=whisper_threads,
+            num_workers=1, compute_type='int8',
+        )
+        logging.info("Retrying transcription on CPU...")
+        return model.transcribe(audio_data, **transcribe_kwargs)
 
 def start_model():
     global model

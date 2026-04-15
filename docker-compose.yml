@@ -6,14 +6,16 @@ services:
     build:
       context: .
     environment:
-       - "WHISPER_MODEL=medium"
+       - "WHISPER_MODEL=large-v3"
        - "WHISPER_THREADS=30"
+       - "COMPUTE_TYPE=float16"
        - "WORD_LEVEL_HIGHLIGHT=False"
        - "TRANSCRIBE_DEVICE=gpu"
        - "TRANSCRIBE_OR_TRANSLATE=transcribe"
        - "DETECT_LANGUAGE_LENGTH=240"
     volumes:
        - "./subgen.py:/subgen/subgen.py"
+       - "./.env:/subgen/.env"
        - "/tmp/subgen/dist-packages:/usr/local/lib/python3.10/dist-packages"
        - "/tmp/subgen/cache:/root/.cache"
        - "/tmp/subgen/models:/models"

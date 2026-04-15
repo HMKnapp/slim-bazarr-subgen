@@ -1,6 +1,11 @@
-subgen_version = '24.11.23'
+subgen_version = '26.04.14'
 
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / '.env')
+
 import xml.etree.ElementTree as ET
 import threading
 from threading import Lock
@@ -10,14 +15,17 @@ import queue
 import logging
 import gc
 import random
+import re
+import json
+import urllib.request
+import urllib.parse
+from collections import Counter
 from typing import Union
 from fastapi import FastAPI, File, UploadFile, Query, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 import numpy as np
 
 import stable_whisper
-from stable_whisper import Segment
-import whisper
 
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
@@ -40,7 +48,8 @@ def update_env_variables():
     global compute_type, reload_script_on_change
     global custom_model_prompt, custom_regroup
     global detect_language_length
-    
+    global tmdb_api_key, vad_filter
+
     whisper_model = os.getenv('WHISPER_MODEL', 'medium')
     whisper_threads = max(1, os.cpu_count() - 1)
     concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 1))
@@ -54,13 +63,214 @@ def update_env_variables():
     compute_type = os.getenv('COMPUTE_TYPE', 'auto')
     reload_script_on_change = convert_to_bool(os.getenv('RELOAD_SCRIPT_ON_CHANGE', False))
     custom_model_prompt = os.getenv('CUSTOM_MODEL_PROMPT', '')
-    custom_regroup = os.getenv('CUSTOM_REGROUP', 'cm_sl=84_sl=42++++++1')
+    custom_regroup = os.getenv('CUSTOM_REGROUP', '')
     detect_language_length = os.getenv('DETECT_LANGUAGE_LENGTH', 240)
+    # Override with TMDB_API_KEY env var to use your own key, or set it to
+    # an empty string to disable prompt enrichment entirely.
+    tmdb_api_key = os.getenv('TMDB_API_KEY', '')
+    # VAD strips non-speech audio (silence, music, background noise) before
+    # transcription. This prevents Whisper from generating non-monotonic timestamp
+    # tokens on quiet/noisy segments, which causes the stable-whisper
+    # "timestamps out of order" warning. Disabled by default because the Silero
+    # VAD model it loads adds ~200-300 MB of VRAM on top of Whisper, which can
+    # cause OOM on GPUs with limited free VRAM (e.g. large-v3 on a 6-8 GB card).
+    # Set VAD_FILTER=true to enable if you have headroom.
+    vad_filter = convert_to_bool(os.getenv('VAD_FILTER', False))
    
     if transcribe_device == "gpu":
         transcribe_device = "cuda"
 
 update_env_variables()
+
+# ── quality/source tags that mark the end of the meaningful filename title ──
+_QUALITY_RE = re.compile(
+    r'[.\s](?:2160p|1080p|720p|480p|4k|bluray|blu-ray|bdrip|brrip|web[-.]?dl|webrip|'
+    r'hmax|dsnp|amzn|nf|hulu|pcok|atvp|hdtv|dvdrip|remux|'
+    r'av1|h\.?264|h\.?265|x264|x265|xvid|hevc|avc|'
+    r'dolby|dts|truehd|atmos|aac|ac3|ddp|dd|flac|mp3|'
+    r'hdr|hdr10|dv|sdr|imax|proper|repack|extended)',
+    re.IGNORECASE,
+)
+
+# ── SxxExx TV episode pattern ──
+_TV_RE = re.compile(
+    r'^(.+?)[.\s]S(\d{1,2})E(\d{1,2})(?:[.\s](.+?))?(?=' + _QUALITY_RE.pattern + r'|$)',
+    re.IGNORECASE,
+)
+
+# ── Movie year pattern ──
+_MOVIE_RE = re.compile(
+    r'^(.+?)[.\s]((?:19|20)\d{2})(?=[.\s])',
+    re.IGNORECASE,
+)
+
+
+def parse_video_filename(video_file: str) -> dict | None:
+    """Return parsed metadata dict from a video filename, or None if unparseable."""
+    name = os.path.splitext(os.path.basename(video_file))[0]
+
+    tv = _TV_RE.match(name)
+    if tv:
+        show = tv.group(1).replace('.', ' ').strip()
+        season = int(tv.group(2))
+        episode = int(tv.group(3))
+        ep_title_raw = tv.group(4)
+        ep_title = ep_title_raw.replace('.', ' ').strip() if ep_title_raw else None
+        # Drop ep_title if it looks like a quality tag
+        if ep_title and _QUALITY_RE.search('.' + ep_title):
+            ep_title = None
+        return {'type': 'tv', 'show': show, 'season': season, 'episode': episode, 'ep_title': ep_title}
+
+    movie = _MOVIE_RE.match(name)
+    if movie:
+        title = movie.group(1).replace('.', ' ').strip()
+        year = int(movie.group(2))
+        return {'type': 'movie', 'title': title, 'year': year}
+
+    return None
+
+
+_SELF_LABELS = {'self', 'himself', 'herself', 'themselves', 'narrator', 'host', 'various'}
+
+def _cast_name(entry: dict) -> str | None:
+    """Return the best name to use for a cast entry as a Whisper hotword.
+
+    For fictional roles use the character name (what's spoken in dialogue).
+    For documentaries/reality shows TMDB sets character to 'Self', 'Himself', etc.;
+    in that case fall back to the real person's name since that's what's spoken.
+    """
+    character = (entry.get('character') or '').strip()
+    if character and character.lower() not in _SELF_LABELS:
+        return character
+    name = (entry.get('name') or '').strip()
+    return name or None
+
+
+def _extract_capitalized(text: str) -> list[str]:
+    """Extract likely proper nouns from a description by finding capitalized words
+    that are NOT sentence starters (those are just grammar, not proper nouns).
+
+    Minimum length of 5 is intentional: short capitalized words like 'May', 'Bay',
+    'New', 'Long', 'Old' are common English words that are also sometimes proper
+    nouns. Boosting them as Whisper hotwords distorts the decoder's probability
+    distribution for normal speech and causes timestamp ordering issues.
+    Words of 5+ chars are far more likely to be genuine distinctive proper nouns.
+    """
+    if not text:
+        return []
+    starters = set(re.findall(r'(?:^|[.!?])\s*([A-Z][a-zA-Z]+)', text))
+    all_caps = re.findall(r'\b([A-Z][a-zA-Z]{4,})\b', text)  # 5+ chars total
+    seen: set[str] = set()
+    result = []
+    for word in all_caps:
+        if word in starters:
+            continue
+        lw = word.lower()
+        if lw not in seen:
+            seen.add(lw)
+            result.append(word)
+    return result
+
+
+def _tmdb_get(path: str, params: dict) -> dict:
+    params = dict(params)
+    params['api_key'] = tmdb_api_key
+    url = f"https://api.themoviedb.org/3{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _build_context_prompt(title_line: str, characters: list[str], keywords: list[str]) -> dict:
+    """Build a compact initial_prompt from title + key proper nouns.
+
+    hotwords is intentionally not used: even short lists of rare proper nouns cause
+    faster-whisper to significantly distort the token probability distribution on
+    every decoding step, which produces non-monotonic timestamp tokens and triggers
+    stable-whisper's "timestamps out of order" warning. Common words (e.g. "Self")
+    are safe because they are already near peak probability and the boost is trivial.
+
+    initial_prompt is safe at ≤30 tokens because Whisper treats it as previously
+    transcribed speech, providing vocabulary context for the first ~30 s segment
+    without disturbing the timestamp predictor. Format it as a natural sentence so
+    Whisper continues in the same style rather than treating it as an instruction.
+    """
+    terms = [t for t in characters[:6] + keywords[:3] if t]
+    if terms:
+        prompt = f"{title_line}: {', '.join(terms)}."
+    else:
+        prompt = title_line
+    # Stay well under 224 tokens; ~200 chars ≈ 50 tokens
+    if len(prompt) > 200:
+        prompt = prompt[:200].rsplit(' ', 1)[0]
+    return {'prompt': prompt}
+
+
+def fetch_media_context(parsed: dict | None) -> dict | None:
+    """Query TMDB and return {'prompt': str, 'hotwords': str}, or None on failure/no key."""
+    if not tmdb_api_key or not parsed:
+        return None
+    try:
+        if parsed['type'] == 'movie':
+            return _fetch_movie_context(parsed['title'], parsed['year'])
+        else:
+            return _fetch_tv_context(parsed['show'], parsed['season'], parsed['episode'])
+    except Exception as e:
+        logging.warning(f"TMDB lookup failed, skipping prompt enrichment: {e}")
+        return None
+
+
+def _fetch_movie_context(title: str, year: int) -> str | None:
+    data = _tmdb_get('/search/movie', {'query': title, 'year': year, 'language': 'en-US'})
+    if not data.get('results'):
+        data = _tmdb_get('/search/movie', {'query': title, 'language': 'en-US'})
+    if not data.get('results'):
+        return None
+
+    movie_id = data['results'][0]['id']
+    # Fetch credits (for character names) and keywords (topic terms) in one request
+    details = _tmdb_get(f'/movie/{movie_id}', {'append_to_response': 'credits,keywords', 'language': 'en-US'})
+
+    characters = [_cast_name(c) for c in details.get('credits', {}).get('cast', [])[:15]]
+    characters = [c for c in characters if c]
+    keywords = [k['name'] for k in details.get('keywords', {}).get('keywords', [])[:12]]
+    keywords += _extract_capitalized(details.get('overview', ''))
+
+    return _build_context_prompt(title, characters, keywords)
+
+
+def _fetch_tv_context(show: str, season: int, episode: int) -> str | None:
+    data = _tmdb_get('/search/tv', {'query': show, 'language': 'en-US'})
+    if not data.get('results'):
+        return None
+
+    series_id = data['results'][0]['id']
+    # Fetch credits and keywords in one request
+    series_details = _tmdb_get(f'/tv/{series_id}', {'append_to_response': 'credits,keywords', 'language': 'en-US'})
+
+    characters = [_cast_name(c) for c in series_details.get('credits', {}).get('cast', [])[:15]]
+    characters = [c for c in characters if c]
+    keywords = [k['name'] for k in series_details.get('keywords', {}).get('results', [])[:12]]
+    keywords += _extract_capitalized(series_details.get('overview', ''))
+
+    try:
+        ep_data = _tmdb_get(f'/tv/{series_id}/season/{season}/episode/{episode}', {'language': 'en-US'})
+        ep_name = ep_data.get('name', '')
+        # Also pull guest stars for this specific episode — they're often the focus
+        guest_chars = [_cast_name(g) for g in ep_data.get('guest_stars', [])[:5]]
+        guest_chars = [c for c in guest_chars if c]
+        characters = (guest_chars + characters)[:15]
+        # Episode overview often names the specific characters/locations featured
+        keywords += _extract_capitalized(ep_data.get('overview', ''))
+    except Exception:
+        ep_name = ''
+
+    title_line = f"{show} S{season:02d}E{episode:02d}"
+    if ep_name:
+        title_line += f" – {ep_name}."
+
+    return _build_context_prompt(title_line, characters, keywords)
+
 
 app = FastAPI()
 model = None
@@ -204,32 +414,71 @@ def status():
 def asr(
         task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
         language: Union[str, None] = Query(default=None),
+        video_file: Union[str, None] = Query(default=None),
         audio_file: UploadFile = File(...),
 ):
     try:
-        logging.info(f"Transcribing {language} from Bazarr/ASR webhook")
+        logging.info(f"Transcribing '{language}' (Bazarr) from ASR webhook")
         result = None
         random_name = ''.join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6))
 
+        # Read audio once; reused for both language detection and transcription.
+        audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
+
+        start_model()
+
+        task_id = { 'path': f"Bazarr-asr-{random_name}" }
+        task_queue.put(task_id)
+
         if force_detected_language_to:
             language = force_detected_language_to
+            logging.info(f"Language forced to: {language}")
+        else:
+            # Bazarr passes 'language' from its own per-series database, which can
+            # be wrong (e.g. a series configured as Swedish but audio is English).
+            # Detect it ourselves and override Bazarr's value; only fall back to
+            # what Bazarr sent if detection itself fails.
+            detected = _detect_language(audio_data)
+            if detected:
+                detected_code = get_key_by_value(whisper_languages, detected)
+                if language and language != detected_code:
+                    logging.info(
+                        f"Language mismatch — Bazarr sent '{language}', "
+                        f"audio detected as '{detected}' ('{detected_code}'). "
+                        f"Using detected language."
+                    )
+                language = detected_code
+            else:
+                logging.info(f"Language detection failed, using Bazarr value: {language}")
+
+        # Build whisper parameters, optionally enriched with TMDB metadata.
+        # Only initial_prompt is used — hotwords cause timestamp drift even with
+        # short proper-noun lists, as the log-prob boost distorts Whisper's decoder.
+        prompt = custom_model_prompt
+        if video_file:
+            parsed = parse_video_filename(video_file)
+            if parsed:
+                media_context = fetch_media_context(parsed)
+                if media_context:
+                    logging.info(f"Enriching whisper context with TMDB data for: {os.path.basename(video_file)}")
+                    ctx_prompt = media_context.get('prompt', '')
+                    prompt = f"{custom_model_prompt} {ctx_prompt}".strip() if custom_model_prompt else ctx_prompt
+                    logging.info(f"Whisper initial_prompt: {prompt}")
 
         start_time = time.time()
-        start_model()
-        
-        task_id = { 'path': f"Bazarr-asr-{random_name}" }        
-        task_queue.put(task_id)
-        
-        audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
+        transcribe_kwargs = dict(
+            task=task, input_sr=16000, language=language,
+            progress_callback=progress, initial_prompt=prompt,
+            vad_filter=vad_filter,
+        )
         if custom_regroup:
-            result = model.transcribe(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
-        else:
-            result = model.transcribe(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt)
+            transcribe_kwargs['regroup'] = custom_regroup
+        result = model.transcribe(audio_data, **transcribe_kwargs)
         elapsed_time = time.time() - start_time
         minutes, seconds = divmod(int(elapsed_time), 60)
         logging.info(f"Bazarr transcription is completed, it took {minutes} minutes and {seconds} seconds to complete.")
     except Exception as e:
-        logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
+        logging.exception(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
     finally:
         task_queue.task_done()
         delete_model()
@@ -243,35 +492,54 @@ def asr(
     else:
         return
 
+def _detect_language(audio_data: np.ndarray) -> str | None:
+    """Run best-of-three language detection at 15 %, 50 % and 80 % of the audio.
+
+    Returns the majority-vote language name (e.g. 'english'), or None on failure.
+    Uses faster-whisper's dedicated detect_language() which only needs 30 s of
+    audio and is far cheaper than a full transcription.
+    """
+    total_samples = len(audio_data)
+    window = 30 * 16000  # 30 s at 16 kHz — Whisper's native detection window
+    votes = []
+    for frac in (0.15, 0.50, 0.80):
+        start = min(int(total_samples * frac), max(0, total_samples - window))
+        chunk = audio_data[start:start + window]
+        if len(chunk) < window:
+            chunk = np.pad(chunk, (0, window - len(chunk)))
+        detect_result = model.detect_language(chunk)
+        logging.debug(f"detect_language returned {len(detect_result)} values: {detect_result!r}")
+        lang = detect_result[0]
+        votes.append(lang)
+    winner = Counter(votes).most_common(1)[0][0]
+    logging.info(f"Language detection votes: {' / '.join(votes)} → {winner}")
+    return winner
+
+
 @app.post("//detect-language")
 @app.post("/detect-language")
 def detect_language(
         audio_file: UploadFile = File(...),
-):  
+):
     global whisper_model
-    detected_language = ""  # Initialize with an empty string
-    language_code = ""  # Initialize with an empty string
-    if int(detect_language_length) != 30:
-        logging.info(f"Detect language is set to detect on the first {detect_language_length} seconds of the audio.")
+    detected_language = ""
+    language_code = ""
     try:
         start_model()
         random_name = ''.join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6))
-        
-        task_id = { 'path': f"Bazarr-detect-language-{random_name}" }        
+        task_id = {'path': f"Bazarr-detect-language-{random_name}"}
         task_queue.put(task_id)
-        
+
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-        detected_language = model.transcribe(whisper.pad_or_trim(audio_data, int(detect_language_length) * 16000), input_sr=16000).language
-        # reverse lookup of language -> code, ex: "english" -> "en", "nynorsk" -> "nn", ...
+        detected_language = _detect_language(audio_data) or ""
         language_code = get_key_by_value(whisper_languages, detected_language)
 
     except Exception as e:
-        logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
-        
+        logging.exception(f"Error detecting language for {audio_file.filename}: {e}")
+
     finally:
         task_queue.task_done()
         delete_model()
-
         return {"detected_language": detected_language, "language_code": language_code}
 
 def start_model():

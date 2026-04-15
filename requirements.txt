@@ -1,4 +1,5 @@
 numpy
+python-dotenv
 git+https://github.com/jianfch/stable-ts.git
 fastapi
 requests
@@ -6,7 +7,6 @@ faster-whisper
 uvicorn
 python-multipart
 python-ffmpeg
-whisper
 transformers
 accelerate
 optimum

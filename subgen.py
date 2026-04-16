@@ -447,14 +447,15 @@ def asr(
             # what Bazarr sent if detection itself fails.
             detected = _detect_language(audio_data)
             if detected:
-                detected_code = get_key_by_value(whisper_languages, detected)
-                if language and language != detected_code:
+                # faster-whisper returns a language code ('ru', 'en', …) directly.
+                # Pass it straight to transcribe — no dict lookup needed.
+                if language and language != detected:
                     logging.info(
                         f"Language mismatch — Bazarr sent '{language}', "
-                        f"audio detected as '{detected}' ('{detected_code}'). "
+                        f"detected '{whisper_languages.get(detected, detected)}' ('{detected}'). "
                         f"Using detected language."
                     )
-                language = detected_code
+                language = detected
             else:
                 logging.info(f"Language detection failed, using Bazarr value: {language}")
 
@@ -539,8 +540,8 @@ def detect_language(
         task_queue.put(task_id)
 
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-        detected_language = _detect_language(audio_data) or ""
-        language_code = get_key_by_value(whisper_languages, detected_language)
+        language_code = _detect_language(audio_data) or ""
+        detected_language = whisper_languages.get(language_code, language_code)
 
     except Exception as e:
         logging.exception(f"Error detecting language for {audio_file.filename}: {e}")

@@ -92,9 +92,9 @@ _TV_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ── Movie year pattern ──
+# ── Movie year pattern — supports dot/space separator and (year) parentheses ──
 _MOVIE_RE = re.compile(
-    r'^(.+?)[.\s]((?:19|20)\d{2})(?=[.\s])',
+    r'^(.+?)[.\s]\(?((?:19|20)\d{2})\)?(?=[.\s)]|$)',
     re.IGNORECASE,
 )
 

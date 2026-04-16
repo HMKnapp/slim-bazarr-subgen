@@ -26,10 +26,10 @@ from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 import numpy as np
 
 import stable_whisper
+import faster_whisper
 
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
-import faster_whisper
 
 def get_key_by_value(d, value):
     reverse_dict = {v: k for k, v in d.items()}
@@ -48,7 +48,7 @@ def update_env_variables():
     global compute_type, reload_script_on_change
     global custom_model_prompt, custom_regroup
     global detect_language_length
-    global tmdb_api_key, vad_filter
+    global tmdb_api_key
 
     whisper_model = os.getenv('WHISPER_MODEL', 'medium')
     whisper_threads = max(1, os.cpu_count() - 1)
@@ -60,7 +60,9 @@ def update_env_variables():
     model_location = '/models'
     transcribe_or_translate = os.getenv('TRANSCRIBE_OR_TRANSLATE', 'transcribe')
     force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', '').lower()
-    compute_type = os.getenv('COMPUTE_TYPE', 'auto')
+    # float32 matches original OpenAI Whisper precision without PyTorch's CUDA
+    # library overhead. Override with COMPUTE_TYPE env var if needed.
+    compute_type = os.getenv('COMPUTE_TYPE', 'float32')
     reload_script_on_change = convert_to_bool(os.getenv('RELOAD_SCRIPT_ON_CHANGE', False))
     custom_model_prompt = os.getenv('CUSTOM_MODEL_PROMPT', '')
     custom_regroup = os.getenv('CUSTOM_REGROUP', '')
@@ -68,14 +70,6 @@ def update_env_variables():
     # Override with TMDB_API_KEY env var to use your own key, or set it to
     # an empty string to disable prompt enrichment entirely.
     tmdb_api_key = os.getenv('TMDB_API_KEY', '')
-    # VAD strips non-speech audio (silence, music, background noise) before
-    # transcription. This prevents Whisper from generating non-monotonic timestamp
-    # tokens on quiet/noisy segments, which causes the stable-whisper
-    # "timestamps out of order" warning. Disabled by default because the Silero
-    # VAD model it loads adds ~200-300 MB of VRAM on top of Whisper, which can
-    # cause OOM on GPUs with limited free VRAM (e.g. large-v3 on a 6-8 GB card).
-    # Set VAD_FILTER=true to enable if you have headroom.
-    vad_filter = convert_to_bool(os.getenv('VAD_FILTER', False))
    
     if transcribe_device == "gpu":
         transcribe_device = "cuda"
@@ -339,6 +333,11 @@ class DeduplicatedQueue(queue.Queue):
 global task_queue
 task_queue = DeduplicatedQueue()
 
+# Ensures only one transcription runs at a time. Without this, parallel
+# requests race on the shared model and delete_model() from one request
+# can null out the model mid-transcription in another.
+_transcription_lock = threading.Lock()
+
 def transcription_worker():
     while True:
         task = task_queue.get()
@@ -422,18 +421,21 @@ def asr(
         video_file: Union[str, None] = Query(default=None),
         audio_file: UploadFile = File(...),
 ):
+    task_queued = False
+    result = None
+    # Read audio before acquiring the lock so the upload doesn't hold up
+    # other requests from even starting their upload.
+    audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
+    _transcription_lock.acquire()
     try:
         logging.info(f"Transcribing '{language}' (Bazarr) from ASR webhook")
-        result = None
         random_name = ''.join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6))
-
-        # Read audio once; reused for both language detection and transcription.
-        audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-
-        start_model()
 
         task_id = { 'path': f"Bazarr-asr-{random_name}" }
         task_queue.put(task_id)
+        task_queued = True
+
+        start_model()
 
         if force_detected_language_to:
             language = force_detected_language_to
@@ -474,7 +476,6 @@ def asr(
         transcribe_kwargs = dict(
             task=task, input_sr=16000, language=language,
             progress_callback=progress, initial_prompt=prompt,
-            vad_filter=vad_filter,
         )
         if custom_regroup:
             transcribe_kwargs['regroup'] = custom_regroup
@@ -485,8 +486,10 @@ def asr(
     except Exception as e:
         logging.exception(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
     finally:
-        task_queue.task_done()
+        if task_queued:
+            task_queue.task_done()
         delete_model()
+        _transcription_lock.release()
     if result:
         return StreamingResponse(
             iter(result.to_srt_vtt(filepath = None, word_level=word_level_highlight)),
@@ -547,27 +550,40 @@ def detect_language(
         delete_model()
         return {"detected_language": detected_language, "language_code": language_code}
 
+def _reload_model_on_cpu():
+    """Free the current model from VRAM and reload it on CPU."""
+    global model
+    try:
+        model.model.unload_model()
+    except Exception:
+        pass
+    model = None
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    logging.info("Loading model on CPU...")
+    model = stable_whisper.load_faster_whisper(
+        whisper_model, download_root=model_location,
+        device='cpu', cpu_threads=whisper_threads,
+        num_workers=1, compute_type='default',
+    )
+
 def _transcribe_with_cpu_fallback(audio_data, transcribe_kwargs):
     """Run transcription; on CUDA OOM reload the model on CPU and retry once."""
     global model
+    if model is None:
+        start_model()
     try:
         return model.transcribe(audio_data, **transcribe_kwargs)
     except RuntimeError as e:
         if 'out of memory' not in str(e).lower():
             raise
-        logging.warning("CUDA out of memory — reloading model on CPU and retrying transcription...")
-        model = None
-        gc.collect()
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        model = stable_whisper.load_faster_whisper(
-            whisper_model, download_root=model_location,
-            device='cpu', cpu_threads=whisper_threads,
-            num_workers=1, compute_type='int8',
-        )
+        logging.warning("CUDA out of memory during transcription — falling back to CPU...")
+        del e  # clear traceback so gc can free the model tensors
+        _reload_model_on_cpu()
         logging.info("Retrying transcription on CPU...")
         return model.transcribe(audio_data, **transcribe_kwargs)
 
@@ -575,7 +591,14 @@ def start_model():
     global model
     if model is None:
         logging.debug("Model was purged, need to re-create")
-        model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
+        try:
+            model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
+        except RuntimeError as e:
+            if 'out of memory' not in str(e).lower():
+                raise
+            logging.warning("CUDA out of memory during model load — falling back to CPU...")
+            del e
+            _reload_model_on_cpu()
 
 def delete_model():
     if task_queue.qsize() == 0:
@@ -583,6 +606,11 @@ def delete_model():
         logging.debug("Queue is empty, clearing/releasing VRAM")
         model = None
         gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 whisper_languages = {
     "en": "english",

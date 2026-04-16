@@ -1,7 +1,7 @@
 = slim bazarr subgen
 
 ====
-_slim bazarr subgen_ uses Whisper AI models to automatically create subtitles for your media files in Bazarr.
+_slim bazarr subgen_ uses local Whisper AI models to automatically create subtitles for your media files for Bazarr.
 ====
 
 It is simply a *slimmed down version of https://github.com/McCloudS/subgen[McCloudS’ subgen]* (thank you for making your code available!) which never worked for me without ugly hacks.
@@ -11,6 +11,13 @@ I did this because I wanted subtitles for a TV show this evening and McCloudS/su
 NOTE: _slim bazarr subgen_ only includes functionality required for https://www.bazarr.media/[Bazarr] subtitle generation
 
 The idea is to have a reliable subtitle service on a much smaller code base which makes it easier to maintain, extend and use.
+
+[#config]
+== Configuration
+*Optional*, if you want to enhance accuracy
+
+- Enable _Pass video filename to Whisper_ in Settings > Providers > Whisper
+- Add an https://developer.themoviedb.org/[TMDB API key] to `.env`
 
 [#design]
 == Design decisions

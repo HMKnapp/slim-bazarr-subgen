@@ -19,6 +19,7 @@ import re
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 from collections import Counter
 from typing import Union
 from fastapi import FastAPI, File, UploadFile, Query, Request
@@ -167,13 +168,28 @@ def _extract_capitalized(text: str) -> list[str]:
     return result
 
 
-def _tmdb_get(path: str, params: dict) -> dict:
+def _tmdb_get(path: str, params: dict) -> dict | None:
     params = dict(params)
     params['api_key'] = tmdb_api_key
     url = f"https://api.themoviedb.org/3{path}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={'Accept': 'application/json'})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                logging.warning("TMDB API key is invalid — continuing without metadata enrichment")
+                return None
+            logging.warning(f"TMDB request failed (attempt {attempt + 1}/3): HTTP {e.code}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            logging.warning(f"TMDB request failed (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    logging.warning("TMDB request failed after 3 attempts, continuing without metadata")
+    return None
 
 
 def _build_context_prompt(title_line: str, characters: list[str], keywords: list[str]) -> dict:
@@ -215,14 +231,13 @@ def fetch_media_context(parsed: dict | None) -> dict | None:
 
 def _fetch_movie_context(title: str, year: int) -> str | None:
     data = _tmdb_get('/search/movie', {'query': title, 'year': year, 'language': 'en-US'})
-    if not data.get('results'):
+    if not data or not data.get('results'):
         data = _tmdb_get('/search/movie', {'query': title, 'language': 'en-US'})
-    if not data.get('results'):
+    if not data or not data.get('results'):
         return None
 
     movie_id = data['results'][0]['id']
-    # Fetch credits (for character names) and keywords (topic terms) in one request
-    details = _tmdb_get(f'/movie/{movie_id}', {'append_to_response': 'credits,keywords', 'language': 'en-US'})
+    details = _tmdb_get(f'/movie/{movie_id}', {'append_to_response': 'credits,keywords', 'language': 'en-US'}) or {}
 
     characters = [_cast_name(c) for c in details.get('credits', {}).get('cast', [])[:15]]
     characters = [c for c in characters if c]
@@ -238,14 +253,13 @@ def _fetch_tv_context(show: str, season: int, episode: int, year: int | None = N
         params['first_air_date_year'] = year
     data = _tmdb_get('/search/tv', params)
     # If year-filtered search returns nothing, retry without it
-    if not data.get('results') and year:
+    if (not data or not data.get('results')) and year:
         data = _tmdb_get('/search/tv', {'query': show, 'language': 'en-US'})
-    if not data.get('results'):
+    if not data or not data.get('results'):
         return None
 
     series_id = data['results'][0]['id']
-    # Fetch credits and keywords in one request
-    series_details = _tmdb_get(f'/tv/{series_id}', {'append_to_response': 'credits,keywords', 'language': 'en-US'})
+    series_details = _tmdb_get(f'/tv/{series_id}', {'append_to_response': 'credits,keywords', 'language': 'en-US'}) or {}
 
     characters = [_cast_name(c) for c in series_details.get('credits', {}).get('cast', [])[:15]]
     characters = [c for c in characters if c]
@@ -253,13 +267,11 @@ def _fetch_tv_context(show: str, season: int, episode: int, year: int | None = N
     keywords += _extract_capitalized(series_details.get('overview', ''))
 
     try:
-        ep_data = _tmdb_get(f'/tv/{series_id}/season/{season}/episode/{episode}', {'language': 'en-US'})
+        ep_data = _tmdb_get(f'/tv/{series_id}/season/{season}/episode/{episode}', {'language': 'en-US'}) or {}
         ep_name = ep_data.get('name', '')
-        # Also pull guest stars for this specific episode — they're often the focus
         guest_chars = [_cast_name(g) for g in ep_data.get('guest_stars', [])[:5]]
         guest_chars = [c for c in guest_chars if c]
         characters = (guest_chars + characters)[:15]
-        # Episode overview often names the specific characters/locations featured
         keywords += _extract_capitalized(ep_data.get('overview', ''))
     except Exception:
         ep_name = ''

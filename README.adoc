@@ -22,9 +22,16 @@ The idea is to have a reliable subtitle service on a much smaller code base whic
 [#design]
 == Design decisions
 
-- caches and models go to `/tmp` (RAM)
-- remove everything not needed for Bazarr
-- less is more
+=== No cluttering
+Python package caches and models go to `/tmp` (RAM). No need to bother your drive with write cycles and using up storage when there is a dedicated *temporary file system for temporary files*.
+
+=== Less is more
+Removed everything not needed for Bazarr from original codebase.
+
+=== STFU
+Software needs to STFU. Don't just abort and complain when there is a way to continue, e.g. if GPU generation fails because of an out of memory error, automatically fall back to CPU generation and *finish the job*.
+
+I'm looking at you, browser companies, that wait for user interaction to retry a failed download... morons.
 
 [#assumptions]
 == Assumptions
